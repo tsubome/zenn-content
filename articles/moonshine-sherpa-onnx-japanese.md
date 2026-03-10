@@ -522,6 +522,332 @@ FUZZY_TH = 0.15                      # 編集距離閾値 15%
 SEARCH_MULT = 12                     # 検索幅倍率
 ```
 
+## コピペで使える SRT 文字起こしスクリプト
+
+本記事で解説したパイプライン（VAD → 分割 → 並列 ASR → ファジーマージ → SRT 生成）を、そのまま使える 1 ファイルのスクリプトにまとめました。
+
+:::details transcribe_moonshine.py（クリックで展開）
+
+### 準備
+
+```bash
+# 1. 依存パッケージ
+pip install sherpa-onnx numpy
+
+# 2. Moonshine モデルのダウンロード (Base JA の例)
+#    HuggingFace から encoder_model.ort, decoder_model_merged.ort, tokens.txt を取得
+#    https://huggingface.co/moonshine-ai/moonshine-base-ja-sherpa-onnx
+mkdir -p moonshine-base-ja
+cd moonshine-base-ja
+# ↑のリンクから 3 ファイルをダウンロードして配置
+
+# 3. Silero VAD モデル
+#    https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
+wget https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
+
+# 4. FFmpeg (mp4/mkv 等を入力する場合)
+#    https://ffmpeg.org/download.html — PATH に追加するか --ffmpeg で指定
+```
+
+### 使い方
+
+```bash
+# 基本（mp4 → SRT, CPU 全コア使用）
+python transcribe_moonshine.py lecture.mp4 \
+  --model ./moonshine-base-ja \
+  --vad ./silero_vad.onnx
+
+# 出力先・スレッド数・FFmpeg パスを指定
+python transcribe_moonshine.py lecture.mp4 \
+  --model ./moonshine-base-ja \
+  --vad ./silero_vad.onnx \
+  --threads 8 \
+  --ffmpeg /usr/local/bin/ffmpeg \
+  -o lecture_sub.srt
+
+# WAV ならFFmpeg不要
+python transcribe_moonshine.py audio.wav \
+  --model ./moonshine-tiny-ja \
+  --vad ./silero_vad.onnx
+```
+
+### スクリプト本体
+
+```python
+"""Moonshine Flavors + Silero VAD → SRT 文字起こし (self-contained)
+
+Usage:
+  python transcribe_moonshine.py input.mp4 --model ./moonshine-base-ja --vad ./silero_vad.onnx
+  python transcribe_moonshine.py input.wav -o output.srt --model ./moonshine-base-ja --vad ./silero_vad.onnx
+"""
+
+import argparse
+import os
+import re
+import sys
+import time
+import wave
+import subprocess
+import tempfile
+import queue
+import numpy as np
+import sherpa_onnx
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ── 定数 ──
+SR = 16000
+TH, SIL, SP, MX = 0.12, 1.2, 0.3, 7.5      # VAD 最適パラメータ
+MAX_DUR, OVERLAP = 8.5, 0.90                  # 秒
+FUZZY_TH, SEARCH_MULT = 0.15, 12             # ファジーマージ
+MIN_SAMP = int(SR * 0.15)                     # 150ms 未満スキップ
+MAX_SAMP = int(SR * MAX_DUR)
+OV_SAMP = int(SR * OVERLAP)
+
+_CJK_SP = re.compile(
+    r'(?<=[\u3000-\u9fff\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uff00-\uffef])'
+    r' '
+    r'(?=[\u3000-\u9fff\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uff00-\uffef])'
+)
+
+
+def find_ffmpeg():
+    """PATH 上の ffmpeg を探す"""
+    import shutil
+    return shutil.which("ffmpeg")
+
+
+def convert_to_wav(path, ffmpeg):
+    if os.path.splitext(path)[1].lower() == '.wav':
+        return path, False
+    if not ffmpeg:
+        print("Error: ffmpeg が見つかりません。--ffmpeg で指定するか PATH に追加してください")
+        sys.exit(1)
+    tmp = tempfile.mktemp(suffix='.wav')
+    subprocess.run(
+        [ffmpeg, '-y', '-i', path, '-ar', '16000', '-ac', '1', '-sample_fmt', 's16', tmp],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return tmp, True
+
+
+def read_wav(path):
+    with wave.open(path, "rb") as f:
+        ch, sr, sw = f.getnchannels(), f.getframerate(), f.getsampwidth()
+        frames = f.readframes(f.getnframes())
+    s = np.frombuffer(frames, dtype=np.int16 if sw == 2 else np.int32).astype(np.float32)
+    s /= (32768.0 if sw == 2 else 2147483648.0)
+    if ch == 2:
+        s = s.reshape(-1, 2).mean(axis=1)
+    assert sr == SR, f"Expected {SR}Hz, got {sr}Hz"
+    return s
+
+
+def run_vad(audio, vad_model):
+    c = sherpa_onnx.VadModelConfig()
+    c.silero_vad.model = vad_model
+    c.silero_vad.threshold = TH
+    c.silero_vad.min_silence_duration = SIL
+    c.silero_vad.min_speech_duration = SP
+    c.silero_vad.max_speech_duration = MX
+    c.sample_rate = SR
+    c.num_threads = 1
+    vad = sherpa_onnx.VoiceActivityDetector(c, buffer_size_in_seconds=300)
+    ws = 512
+    for off in range(0, len(audio) - ws + 1, ws):
+        vad.accept_waveform(audio[off:off + ws])
+    tail = len(audio) % ws
+    if tail:
+        pad = np.zeros(ws, dtype=np.float32)
+        pad[:tail] = audio[-tail:]
+        vad.accept_waveform(pad)
+    vad.flush()
+    segs = []
+    while not vad.empty():
+        seg = vad.front
+        samples = np.array(seg.samples, dtype=np.float32)
+        if len(samples) >= MIN_SAMP:
+            segs.append((samples, seg.start))
+        vad.pop()
+    return segs
+
+
+def split_ov(samples):
+    """長セグメントをオーバーラップ付きで分割"""
+    chunks, stride = [], MAX_SAMP - OV_SAMP
+    off = 0
+    while off < len(samples):
+        end = min(off + MAX_SAMP, len(samples))
+        if end - off >= MIN_SAMP:
+            chunks.append(samples[off:end])
+        if end == len(samples):
+            break
+        off += stride
+    return chunks
+
+
+def edit_dist(a, b):
+    """編集距離 (1行 DP)"""
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            tmp = dp[j]
+            dp[j] = prev if a[i-1] == b[j-1] else 1 + min(prev, dp[j], dp[j-1])
+            prev = tmp
+    return dp[n]
+
+
+def merge_fuzzy(texts):
+    """ファジー suffix-prefix マッチでオーバーラップ部分を除去しながら結合"""
+    if len(texts) <= 1:
+        return "".join(texts)
+    search = max(3, int(OVERLAP * SEARCH_MULT))
+    merged = texts[0]
+    for t in texts[1:]:
+        if not t:
+            continue
+        best = 0
+        for k in range(2, min(len(merged), len(t), search) + 1):
+            if edit_dist(merged[-k:], t[:k]) <= max(1, int(k * FUZZY_TH)):
+                best = k
+        merged += t[best:]
+    return merged
+
+
+def fmt_srt(sec):
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int((s % 1) * 1000):03d}"
+
+
+def transcribe(input_path, model_dir, vad_model, ffmpeg, threads):
+    t0 = time.perf_counter()
+
+    wav, tmp = convert_to_wav(input_path, ffmpeg)
+    audio = read_wav(wav)
+    dur = len(audio) / SR
+    print(f"  音声: {dur:.1f}s ({dur/60:.1f}分)")
+
+    print("  VAD ...", end="", flush=True)
+    segs = run_vad(audio, vad_model)
+    print(f" {len(segs)} セグメント")
+
+    normal = [(s, st) for s, st in segs if len(s) <= MAX_SAMP]
+    long   = [(s, st) for s, st in segs if len(s) > MAX_SAMP]
+
+    # ASR プール (queue 方式で Recognizer を排他貸出)
+    rq = queue.Queue()
+    enc = f"{model_dir}/encoder_model.ort"
+    dec = f"{model_dir}/decoder_model_merged.ort"
+    tok = f"{model_dir}/tokens.txt"
+    for p in [enc, dec, tok]:
+        if not os.path.exists(p):
+            print(f"Error: {p} が見つかりません"); sys.exit(1)
+    print(f"  ASR プール ({threads} スレッド) ...", end="", flush=True)
+    for _ in range(threads):
+        rq.put(sherpa_onnx.OfflineRecognizer.from_moonshine_v2(
+            encoder=enc, decoder=dec, tokens=tok, num_threads=1))
+    print(" OK")
+
+    pool = ThreadPoolExecutor(max_workers=threads)
+
+    def recognize(samples):
+        rec = rq.get()
+        try:
+            st = rec.create_stream()
+            st.accept_waveform(SR, samples)
+            rec.decode_stream(st)
+            return _CJK_SP.sub('', st.result.text.strip())
+        finally:
+            rq.put(rec)
+
+    # 全ワーク準備
+    work, long_map = [], {}
+    for s, st in normal:
+        work.append((s, ('n', st, len(s))))
+    for li, (s, st) in enumerate(long):
+        chunks = split_ov(s)
+        long_map[li] = (st, len(chunks), len(s))
+        for ci, ch in enumerate(chunks):
+            work.append((ch, ('c', li, ci)))
+
+    print(f"  ASR 処理中: {len(work)} 件 ...", end="", flush=True)
+    ta = time.perf_counter()
+    futs = {pool.submit(recognize, s): tag for s, tag in work}
+
+    n_res, c_res = [], {}
+    for f in as_completed(futs):
+        tag, txt = futs[f], f.result()
+        if tag[0] == 'n':
+            _, st, ns = tag
+            if txt:
+                n_res.append((st / SR, st / SR + ns / SR, txt))
+        else:
+            _, li, ci = tag
+            c_res.setdefault(li, []).append((ci, txt))
+
+    l_res = []
+    for li, (st, nc, ns) in long_map.items():
+        if li in c_res:
+            texts = [t for _, t in sorted(c_res[li]) if t]
+            merged = merge_fuzzy(texts)
+            if merged:
+                l_res.append((st / SR, st / SR + ns / SR, merged))
+
+    print(f" {time.perf_counter() - ta:.1f}s")
+    pool.shutdown(wait=False)
+
+    entries = sorted(n_res + l_res, key=lambda x: x[0])
+    elapsed = time.perf_counter() - t0
+    rtf = elapsed / dur if dur > 0 else 0
+    print(f"  完了: {len(entries)} エントリ | {elapsed:.1f}s (RTF={rtf:.4f}, {1/rtf:.0f}x)")
+
+    if tmp and os.path.exists(wav):
+        os.remove(wav)
+
+    lines = []
+    for i, (s, e, t) in enumerate(entries, 1):
+        lines += [str(i), f"{fmt_srt(s)} --> {fmt_srt(e)}", t, ""]
+    return "\n".join(lines)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Moonshine Flavors + VAD → SRT")
+    p.add_argument("input", help="入力ファイル (mp4/wav/etc)")
+    p.add_argument("-o", "--output", help="出力 SRT パス (省略時: 入力名_moonshine.srt)")
+    p.add_argument("--model", required=True, help="モデルディレクトリ")
+    p.add_argument("--vad", required=True, help="silero_vad.onnx のパス")
+    p.add_argument("--ffmpeg", default=None, help="ffmpeg パス (省略時: PATH から検索)")
+    p.add_argument("--threads", type=int, default=os.cpu_count() or 4,
+                   help=f"並列スレッド数 (デフォルト: {os.cpu_count() or 4})")
+    args = p.parse_args()
+
+    if not os.path.exists(args.input):
+        print(f"Error: {args.input} not found"); sys.exit(1)
+
+    out = args.output or os.path.splitext(args.input)[0] + "_moonshine.srt"
+    ffmpeg = args.ffmpeg or find_ffmpeg()
+
+    print(f"\n{'='*60}")
+    print(f"  Moonshine SRT 文字起こし")
+    print(f"  モデル : {os.path.basename(args.model)}")
+    print(f"  スレッド: {args.threads}")
+    print(f"  入力  : {args.input}")
+    print(f"  出力  : {out}")
+    print(f"{'='*60}\n")
+
+    srt = transcribe(args.input, args.model, args.vad, ffmpeg, args.threads)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(srt)
+    print(f"\n  SRT 保存: {out}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+:::
+
 ## まとめ
 
 | 項目 | 結果 |
