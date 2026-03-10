@@ -3,7 +3,7 @@ title: "Moonshine Voice ASR を sherpa-onnx で動かして日本語文字起こ
 emoji: "🎙"
 type: "tech"
 topics: ["moonshine", "whisper", "asr", "sherpaonnx", "python"]
-published: false
+published: true
 ---
 
 ## はじめに
