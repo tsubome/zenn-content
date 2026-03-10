@@ -388,6 +388,57 @@ CPU のみで 72 分の講義を **約 3.5 分で文字起こし**（RTF = 0.038
 72分と11分で F1 に大きな差（87.9% vs 96.8%）がある理由は、音声の違いによるものです。72分音声は話者交代、質疑応答、無音区間が多く、11分音声よりも複雑な構成です。また、リファレンス自体が Whisper 出力のため、Whisper の誤認識もスコアに影響します。
 :::
 
+### テスト環境と並列処理
+
+上記の処理時間は以下の環境で測定しています:
+
+| 項目 | スペック |
+|------|---------|
+| PC | ASUS Zenbook 14 (UX3405CA) |
+| CPU | Intel Core Ultra 9 285H (16コア / 16スレッド) |
+| RAM | 32GB |
+| GPU | **不使用**（CPU 推論のみ） |
+| OS | Windows 11 |
+
+処理速度の大きな要因として、**16 スレッド並列 ASR** があります。セグメントごとに独立した Recognizer インスタンスを `queue.Queue` で排他管理し、`ThreadPoolExecutor` で同時処理しています:
+
+```python
+import queue
+from concurrent.futures import ThreadPoolExecutor
+
+class ASRPool:
+    def __init__(self, n_workers=16):
+        self._rec_queue = queue.Queue()
+        self.pool = ThreadPoolExecutor(max_workers=n_workers)
+        # 各ワーカーに専用の Recognizer を割り当て（num_threads=1）
+        for _ in range(n_workers):
+            self._rec_queue.put(
+                sherpa_onnx.OfflineRecognizer.from_moonshine_v2(
+                    encoder="moonshine-base-ja/encoder_model.ort",
+                    decoder="moonshine-base-ja/decoder_model_merged.ort",
+                    tokens="moonshine-base-ja/tokens.txt",
+                    num_threads=1,  # Recognizer 内部は 1 スレッド
+                )
+            )
+
+    def recognize_one(self, samples):
+        rec = self._rec_queue.get()      # 空きが出るまでブロック
+        try:
+            stream = rec.create_stream()
+            stream.accept_waveform(SAMPLE_RATE, samples)
+            rec.decode_stream(stream)
+            return clean_text(stream.result.text.strip())
+        finally:
+            self._rec_queue.put(rec)      # 使い終わったら返却
+```
+
+ポイント:
+- Recognizer ごとに `num_threads=1` とし、**並列度はプロセスレベルで制御**
+- sherpa-onnx の推論は内部で C++ ネイティブコードが走るため、Python の GIL の影響を受けない
+- 全セグメントを一括で `pool.submit()` に投入し、`as_completed()` で結果を回収
+
+1 スレッド（逐次処理）で同じ 72 分音声を処理すると、16 スレッド並列に比べて約 4〜5 倍の時間がかかります。コア数の少ない環境では RTF がこの数値より大きくなる点にご注意ください。
+
 ## CJK スペース除去
 
 Moonshine の日本語モデルは一部の出力で文字間にスペースを挿入します。以下の正規表現で CJK 文字間のスペースのみを除去します:
@@ -477,7 +528,8 @@ SEARCH_MULT = 12                     # 検索幅倍率
 | 公式 CER | 13.62% (FLEURS, 人間リファレンス) |
 | Whisper 出力との一致度 (11分) | F1 96.82% (ASR 間比較) |
 | Whisper 出力との一致度 (72分) | F1 87.91% (fuzzy merge 込み) |
-| 速度 | RTF 0.025〜0.038 (CPU, 26〜40 倍速) |
+| 速度 | RTF 0.025〜0.038 (CPU 16スレッド並列, 26〜40 倍速) |
+| テスト環境 | ASUS Zenbook 14 / Core Ultra 9 285H / 32GB RAM |
 | 必須の知識 | ONNX量子化モデルの入力長上限 ~10秒、VoiceActivityDetector を使う |
 | 最大の改善要因 | max_speech_duration 調整 (10→7.5 で大幅改善) |
 
