@@ -522,9 +522,9 @@ FUZZY_TH = 0.15                      # 編集距離閾値 15%
 SEARCH_MULT = 12                     # 検索幅倍率
 ```
 
-## コピペで使える SRT 文字起こしスクリプト
+## コピペで使える文字起こしスクリプト
 
-本記事で解説したパイプライン（VAD → 分割 → 並列 ASR → ファジーマージ → SRT 生成）を、そのまま使える 1 ファイルのスクリプトにまとめました。
+本記事で解説したパイプライン（VAD → 分割 → 並列 ASR → ファジーマージ → SRT/TXT 生成）を、そのまま使える 1 ファイルのスクリプトにまとめました。
 
 :::details transcribe_moonshine.py（クリックで展開）
 
@@ -535,38 +535,49 @@ SEARCH_MULT = 12                     # 検索幅倍率
 pip install sherpa-onnx numpy
 
 # 2. Moonshine モデルのダウンロード (Base JA の例)
-#    HuggingFace から encoder_model.ort, decoder_model_merged.ort, tokens.txt を取得
-#    https://huggingface.co/moonshine-ai/moonshine-base-ja-sherpa-onnx
-mkdir -p moonshine-base-ja
-cd moonshine-base-ja
-# ↑のリンクから 3 ファイルをダウンロードして配置
+#    https://huggingface.co/tubome/whisperapp-asr-models から tar.gz を取得して展開
+#    展開すると moonshine-base-ja/ に encoder_model.ort, decoder_model_merged.ort, tokens.txt が入る
+wget https://huggingface.co/tubome/whisperapp-asr-models/resolve/main/moonshine-base-ja.tar.gz
+tar xzf moonshine-base-ja.tar.gz
+
+# Tiny JA (より高速・軽量) を使う場合:
+# wget https://huggingface.co/tubome/whisperapp-asr-models/resolve/main/moonshine-tiny-ja.tar.gz
+# tar xzf moonshine-tiny-ja.tar.gz
 
 # 3. Silero VAD モデル
-#    https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
 wget https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
 
-# 4. FFmpeg (mp4/mkv 等を入力する場合)
-#    https://ffmpeg.org/download.html — PATH に追加するか --ffmpeg で指定
+# 4. FFmpeg (mp4/mkv 等を入力する場合。WAV なら不要)
+#    macOS:   brew install ffmpeg
+#    Ubuntu:  sudo apt install ffmpeg
+#    Windows: https://www.gyan.dev/ffmpeg/builds/ から release full をダウンロード
+#             → 展開して bin/ffmpeg.exe を PATH に追加するか --ffmpeg で指定
 ```
 
 ### 使い方
 
 ```bash
 # 基本（mp4 → SRT, CPU 全コア使用）
-python transcribe_moonshine.py lecture.mp4 \
+python transcribe_moonshine.py meeting.mp4 \
   --model ./moonshine-base-ja \
   --vad ./silero_vad.onnx
 
+# テキスト形式で出力（タイムスタンプなし、セグメント区切りは改行）
+python transcribe_moonshine.py meeting.mp4 \
+  --model ./moonshine-base-ja \
+  --vad ./silero_vad.onnx \
+  --format txt
+
 # 出力先・スレッド数・FFmpeg パスを指定
-python transcribe_moonshine.py lecture.mp4 \
+python transcribe_moonshine.py interview.mp4 \
   --model ./moonshine-base-ja \
   --vad ./silero_vad.onnx \
   --threads 8 \
   --ffmpeg /usr/local/bin/ffmpeg \
-  -o lecture_sub.srt
+  -o interview_sub.srt
 
 # WAV ならFFmpeg不要
-python transcribe_moonshine.py audio.wav \
+python transcribe_moonshine.py recording.wav \
   --model ./moonshine-tiny-ja \
   --vad ./silero_vad.onnx
 ```
@@ -574,11 +585,11 @@ python transcribe_moonshine.py audio.wav \
 ### スクリプト本体
 
 ```python
-"""Moonshine Flavors + Silero VAD → SRT 文字起こし (self-contained)
+"""Moonshine Flavors + Silero VAD → SRT/TXT 文字起こし (self-contained)
 
 Usage:
   python transcribe_moonshine.py input.mp4 --model ./moonshine-base-ja --vad ./silero_vad.onnx
-  python transcribe_moonshine.py input.wav -o output.srt --model ./moonshine-base-ja --vad ./silero_vad.onnx
+  python transcribe_moonshine.py input.wav -o output.txt --format txt --model ./moonshine-base-ja --vad ./silero_vad.onnx
 """
 
 import argparse
@@ -761,7 +772,6 @@ def transcribe(input_path, model_dir, vad_model, ffmpeg, threads):
         finally:
             rq.put(rec)
 
-    # 全ワーク準備
     work, long_map = [], {}
     for s, st in normal:
         work.append((s, ('n', st, len(s))))
@@ -805,16 +815,26 @@ def transcribe(input_path, model_dir, vad_model, ffmpeg, threads):
     if tmp and os.path.exists(wav):
         os.remove(wav)
 
+    return entries
+
+
+def format_srt(entries):
     lines = []
     for i, (s, e, t) in enumerate(entries, 1):
         lines += [str(i), f"{fmt_srt(s)} --> {fmt_srt(e)}", t, ""]
     return "\n".join(lines)
 
 
+def format_txt(entries):
+    return "\n".join(t for _, _, t in entries) + "\n"
+
+
 def main():
-    p = argparse.ArgumentParser(description="Moonshine Flavors + VAD → SRT")
+    p = argparse.ArgumentParser(description="Moonshine Flavors + VAD → SRT/TXT")
     p.add_argument("input", help="入力ファイル (mp4/wav/etc)")
-    p.add_argument("-o", "--output", help="出力 SRT パス (省略時: 入力名_moonshine.srt)")
+    p.add_argument("-o", "--output", help="出力パス (省略時: 入力名_moonshine.srt or .txt)")
+    p.add_argument("--format", choices=["srt", "txt"], default="srt",
+                   help="出力形式 (デフォルト: srt)")
     p.add_argument("--model", required=True, help="モデルディレクトリ")
     p.add_argument("--vad", required=True, help="silero_vad.onnx のパス")
     p.add_argument("--ffmpeg", default=None, help="ffmpeg パス (省略時: PATH から検索)")
@@ -825,21 +845,23 @@ def main():
     if not os.path.exists(args.input):
         print(f"Error: {args.input} not found"); sys.exit(1)
 
-    out = args.output or os.path.splitext(args.input)[0] + "_moonshine.srt"
+    ext = ".txt" if args.format == "txt" else ".srt"
+    out = args.output or os.path.splitext(args.input)[0] + f"_moonshine{ext}"
     ffmpeg = args.ffmpeg or find_ffmpeg()
 
     print(f"\n{'='*60}")
-    print(f"  Moonshine SRT 文字起こし")
+    print(f"  Moonshine 文字起こし ({args.format.upper()})")
     print(f"  モデル : {os.path.basename(args.model)}")
     print(f"  スレッド: {args.threads}")
     print(f"  入力  : {args.input}")
     print(f"  出力  : {out}")
     print(f"{'='*60}\n")
 
-    srt = transcribe(args.input, args.model, args.vad, ffmpeg, args.threads)
+    entries = transcribe(args.input, args.model, args.vad, ffmpeg, args.threads)
+    content = format_txt(entries) if args.format == "txt" else format_srt(entries)
     with open(out, "w", encoding="utf-8") as f:
-        f.write(srt)
-    print(f"\n  SRT 保存: {out}")
+        f.write(content)
+    print(f"\n  保存: {out}")
 
 
 if __name__ == "__main__":
